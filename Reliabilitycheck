@@ -1,0 +1,70 @@
+# --------------------------------
+# Reliability & Validity metrics
+# --------------------------------
+from math import sqrt
+
+# === DEFINE YOUR CONSTRUCTS HERE ===
+constructs = {
+    "DG": [
+        "In your objective assessment, how would you describe the current state of data quality within your organization?",
+        "To what extent do you agree with the following statement: 'The roles of data owners are clearly defined within my organization.'",
+        "How effective are the processes for database management in your organization?",
+        "How effective are the processes for data integration in your organization?",
+        "Please indicate your level of agreement with the following statement: 'Our organization has comprehensive data privacy measures in place.'",
+        "Has your organization published a data governance policy?",
+        "Please indicate whether employees adhere to the established data governance policy in their daily routines.",
+        "Please evaluate the extent to which your organization adheres to data-related laws and regulations like BCBS, MIFID, HIPAA, PCI-DSS, GDPR etc.",
+        "How would you rate the quality of your organization’s financial and non-financial reporting?"
+    ],
+    "OP": [
+        "Please rate your organization’s approximate year-on-year financial performance?",
+        "How efficient are your organization’s cost management, and resource utilization?",
+        "How satisfied are your customers with your organization’s services?",
+        "How engaged and satisfied are the employees in your organization?",
+        "How would you rate your organization’s investment in Research & Development activities and the resulting output?",
+        "How would you rate the perception of your organization’s brand and reputation among shareholders?",
+        "How effective are your organization’s sustainability initiatives and compliance with environmental regulations?",
+        "How committed is your organization to social responsibility and contributions to social causes?",
+        "How frequently does your organization encounter operational risk incidents?"
+    ]
+    # Add CG here if needed
+}
+
+# Helper: Cronbach's alpha
+def cronbach_alpha(df_block):
+    k = df_block.shape[1]
+    variances = df_block.var(axis=0, ddof=1)
+    total_var = df_block.sum(axis=1).var(ddof=1)
+    return (k / (k - 1)) * (1 - variances.sum() / total_var) if k > 1 else np.nan
+
+# Helper: Composite Reliability & AVE
+def cr_ave(df_block):
+    # Standardized loadings (correlation of item with construct composite score)
+    construct_score = df_block.mean(axis=1)
+    loadings = [df_block[c].corr(construct_score) for c in df_block.columns]
+    loadings_sq = [l**2 for l in loadings]
+    # Composite Reliability
+    CR = sum(loadings)**2 / (sum(loadings)**2 + sum([1 - l**2 for l in loadings]))
+    # Average Variance Extracted
+    AVE = sum(loadings_sq) / len(loadings_sq)
+    return CR, AVE
+
+# Compute metrics
+results = []
+for name, cols in constructs.items():
+    matched_cols = [match_anchor(c, df_conv.columns) for c in cols]
+    matched_cols = [c for c in matched_cols if c in df_conv.columns]
+    block = df_conv[matched_cols].dropna()
+    alpha = cronbach_alpha(block)
+    CR, AVE = cr_ave(block)
+    results.append({
+        "Construct": name,
+        "Items": len(matched_cols),
+        "Cronbach_alpha": round(alpha, 3),
+        "Composite_Reliability": round(CR, 3),
+        "AVE": round(AVE, 3)
+    })
+
+reliability_df = pd.DataFrame(results)
+reliability_df.to_excel("construct_reliability_metrics.xlsx", index=False)
+print(reliability_df)

@@ -1,0 +1,216 @@
+import argparse
+import pandas as pd
+import numpy as np
+import re
+from pathlib import Path
+
+# -------------------------------
+# Helpers
+# -------------------------------
+def norm_text(s):
+    """Normalize weird encodings, whitespace and newlines in column names."""
+    if not isinstance(s, str):
+        s = str(s)
+    s = s.replace("\n", " ").replace("\r", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    # Fix common encoding artifacts
+    s = (s
+         .replace("â€™", "'").replace("â€˜", "'")
+         .replace("â€œ", '"').replace("â€\x9d", '"')
+         .replace("â€“", "-").replace("Â", ""))
+    return s
+
+def match_anchor(anchor, columns):
+    """Return the first column whose normalized name contains the normalized anchor."""
+    a = norm_text(anchor).lower()
+    for c in columns:
+        if a in c.lower():
+            return c
+    return None
+
+# Likert dictionaries used to normalize text answers
+AGREEMENT = {
+    'strongly disagree':1, 'disagree':2, 'neutral':3, 'neither agree nor disagree':3,
+    'agree':4, 'strongly agree':5
+}
+EFFECT = {
+    'very ineffective':1, 'ineffective':2, 'neutral':3, 'effective':4, 'very effective':5
+}
+QUALITY = {
+    'very poor':1, 'poor':2, 'fair':3, 'average':3, 'good':4, 'very good':5, 'excellent':5
+}
+FREQ = {  # frequency (positive direction)
+    'never':1, 'rarely':2, 'seldom':2, 'sometimes':3, 'occasionally':3,
+    'often':4, 'frequently':4, 'very often':4, 'always':5, 'almost always':5
+}
+EXTENT = {
+    'not at all':1, 'to a small extent':2, 'small extent':2,
+    'to some extent':3, 'some extent':3,
+    'to a great extent':4, 'great extent':4,
+    'fully':5, 'completely':5
+}
+HIGH_LOW = {  # generic low→high
+    'very low':1, 'low':2, 'medium':3, 'moderate':3, 'high':4, 'very high':5
+}
+SAT = {
+    'very dissatisfied':1, 'dissatisfied':2, 'neutral':3, 'satisfied':4, 'very satisfied':5
+}
+COMPLIANCE = {
+    'low on compliance':1, 'medium on compliance':3, 'high on compliance':5,
+    'non-compliant':1, 'non compliant':1,
+    'partially compliant':2, 'mostly compliant':3, 'compliant':4, 'fully compliant':5,
+    "don't know":np.nan, 'prefer not to answer':np.nan
+}
+
+def map_from_dict(series, mapping):
+    s = series.astype(str).str.strip().str.lower()
+    return s.replace(mapping)
+
+def percent_to_likert(series):
+    """
+    Map a percentage (possibly in text) into a 1–5 Likert:
+    (-inf,0]→1, (0,5]→2, (5,10]→3, (10,20]→4, >20→5
+    """
+    s = series.astype(str)
+    # try numeric directly
+    num = pd.to_numeric(s, errors='coerce')
+    if num.notna().sum() == 0:
+        # extract first number from text (e.g., "12%", "10-15%")
+        num = pd.to_numeric(s.str.extract(r'(-?\d+\.?\d*)')[0], errors='coerce')
+    bins = [-np.inf, 0, 5, 10, 20, np.inf]
+    labels = [1, 2, 3, 4, 5]
+    return pd.cut(num, bins=bins, labels=labels).astype(float)
+
+def generic_convert_to_likert(series):
+    """
+    Generic layered conversion to numeric Likert:
+    1) numeric in [1..7] → keep
+    2) dictionaries (agreement/effect/quality/frequency/extent/high-low/satisfaction/compliance)
+    3) percentage → 1–5 Likert (bins)
+    4) leading integer (constrained to 1–7)
+    5) fallback numeric coercion (may yield NaN)
+    """
+    s_raw = series.copy()
+    s = series.astype(str).str.strip().str.lower()
+
+    # 1) numeric already in 1–7
+    num = pd.to_numeric(s, errors='coerce')
+    if num.notna().sum() > 0 and num.min(skipna=True) >= 1 and num.max(skipna=True) <= 7:
+        return num
+
+    # 2) dictionaries
+    for mapping in (AGREEMENT, EFFECT, QUALITY, FREQ, EXTENT, HIGH_LOW, SAT, COMPLIANCE):
+        mapped = map_from_dict(s_raw, mapping)
+        num2 = pd.to_numeric(mapped, errors='coerce')
+        # accept mapping if it covers enough rows
+        if num2.notna().sum() >= max(0.3*len(series), 20):
+            return num2
+
+    # 3) percentage
+    perc_map = percent_to_likert(s_raw)
+    if perc_map.notna().sum() >= max(0.3*len(series), 20):
+        return perc_map
+
+    # 4) leading integer
+    lead = pd.to_numeric(s.str.extract(r'^(-?\d{1,2})')[0], errors='coerce')
+    if lead.notna().sum() >= max(0.3*len(series), 20):
+        lead = lead.where((lead >= 1) & (lead <= 7))
+        return lead
+
+    # 5) fallback
+    return pd.to_numeric(s, errors='coerce')
+
+# Columns to leave untouched (identifiers/free-text)
+EXCLUDE_COLS = [
+    'Timestamp', 'Username', 'Age', 'Gender', 'Education',
+    'Years of experience', 'Current Position', 'Department',
+    'Please specify the organization you are affiliated with?',
+    "Please indicate your organization's headquarter?",
+    'Please indicate the industry you work in?',
+    'Please list the individuals who directly have ownership of data in your organization.'
+]
+
+# Anchors for column-specific rules
+POLICY_ANCHOR = "Has your organization published a data governance policy?"
+COMPLIANCE_ANCHOR = "Which of the options below suits your Organization's compliance posture with regulations?"
+FINANCIAL_ANCHOR = "Please rate your organization’s approximate year-on-year financial performance?"
+
+# -------------------------------
+# Main
+# -------------------------------
+def run(input_path: str, output_path: str, report_path: str):
+    p = Path(input_path)
+    if p.suffix.lower() in [".xlsx", ".xls"]:
+        df = pd.read_excel(p)
+    else:
+        df = pd.read_csv(p)
+
+    # Normalize column names
+    df.columns = [norm_text(c) for c in df.columns]
+
+    # Prepare output
+    df_conv = df.copy()
+
+    # Generic conversion for all non-excluded columns
+    for col in df.columns:
+        if col in EXCLUDE_COLS:
+            continue
+        df_conv[col] = generic_convert_to_likert(df[col])
+
+    # Column-specific overrides
+    policy_col = match_anchor(POLICY_ANCHOR, df.columns)
+    comp_col = match_anchor(COMPLIANCE_ANCHOR, df.columns)
+    fin_col = match_anchor(FINANCIAL_ANCHOR, df.columns)
+
+    # DG policy: Yes/No -> 1/0
+    if policy_col:
+        s = df[policy_col].astype(str).str.strip().str.lower()
+        df_conv[policy_col] = s.replace({'yes': 1, 'y': 1, 'no': 0, 'n': 0})
+
+    # Compliance posture: map to 1/3/5 (NaN for unknown)
+    if comp_col:
+        df_conv[comp_col] = map_from_dict(df[comp_col], COMPLIANCE)
+
+    # Financial performance: % → 1–5
+    if fin_col:
+        df_conv[fin_col] = percent_to_likert(df[fin_col])
+
+    # Validation report
+    def assess_col(series):
+        is_num = pd.api.types.is_numeric_dtype(series)
+        minv = series.min(skipna=True) if is_num else np.nan
+        maxv = series.max(skipna=True) if is_num else np.nan
+        coverage = series.notna().mean()
+        in_range = bool(is_num and (pd.isna(minv) or pd.isna(maxv) or (1 <= minv <= 7 and 1 <= maxv <= 7)))
+        return is_num, minv, maxv, coverage, in_range
+
+    rows = []
+    for col in df.columns:
+        if col in EXCLUDE_COLS:
+            continue
+        is_num, minv, maxv, coverage, in_range = assess_col(df_conv[col])
+        rows.append({
+            "column": col,
+            "numeric": is_num,
+            "min": minv,
+            "max": maxv,
+            "non_null_coverage_pct": round(coverage*100, 1),
+            "within_1_to_7": in_range
+        })
+    report_df = pd.DataFrame(rows)
+
+    # Save outputs
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+    df_conv.to_excel(output_path, index=False)
+    report_df.to_excel(report_path, index=False)
+    print(f"[OK] Saved analysis-ready dataset -> {output_path}")
+    print(f"[OK] Saved validation report -> {report_path}")
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True, help="Path to original survey file (.xlsx or .csv)")
+    ap.add_argument("--output", default="Survey_FINAL_ANALYSIS_READY.xlsx", help="Path for cleaned Excel output")
+    ap.add_argument("--report", default="Survey_FINAL_validation_report.xlsx", help="Path for validation report Excel")
+    args = ap.parse_args()
+    run(args.input, args.output, args.report)
